@@ -88,16 +88,17 @@ struct EventsEntryView: View {
     }
 
     private func twoColumnLayout(height: CGFloat) -> some View {
-        // Both columns get a heuristic-derived fit estimate so ViewThatFits only
-        // needs to evaluate a small window of candidates around it (~9 each)
-        // instead of the full ladder up to fetchLimit (60). PreferenceKey
-        // publishes the chosen left count so the right column starts exactly
-        // where the left column ended — no gaps.
+        // Left column receives the full upcoming list and runs ViewThatFits
+        // over a window of candidates around the heuristic. The chosen count
+        // is published via PreferenceKey to leftFitCount, and the right column
+        // starts exactly where the left left off — no overlap, no skipped
+        // events. This is slower than a single-pass render (each candidate
+        // builds a Button(intent:) tree) but it's the only way to get correct
+        // per-pixel fit when the heuristic is imprecise.
         let leftEst = computeFitCount(from: 0, height: height)
         let leftEnd = leftFitCount > 0 ? leftFitCount : leftEst
         let rightSlice = Array(entry.events.dropFirst(leftEnd))
         let rightEst = computeFitCount(from: leftEnd, height: height)
-
         return HStack(alignment: .top, spacing: 16) {
             adaptiveColumn(events: entry.events, estimate: leftEst, publishCount: true)
             adaptiveColumn(events: rightSlice, estimate: rightEst, publishCount: false)
@@ -155,6 +156,7 @@ struct EventsEntryView: View {
     private func approxRowHeight(for event: EventDisplay) -> CGFloat {
         // Two-line stacked time only when start and end fall on the same day
         // and it's not all-day — matches the rendering branch in trailingText.
+        // Mildly conservative; ViewThatFits in adaptiveColumn corrects up or down.
         let stacked = !event.isAllDay
             && Calendar.current.isDate(event.startDate, inSameDayAs: event.endDate)
         let lineHeight: CGFloat = family == .systemMedium ? 19 : 22
@@ -168,34 +170,27 @@ struct EventsEntryView: View {
         estimate: Int = 0,
         publishCount: Bool = false
     ) -> some View {
+        // Window of candidates around the heuristic estimate. ViewThatFits
+        // picks the largest count whose rendered tree actually fits the
+        // available height — corrects up if the heuristic under-counted, down
+        // if it over-counted. Window is asymmetric (more upward) since the
+        // heuristic tends to be slightly conservative on row heights.
         let n = events.count
-        // Narrow candidate window around the heuristic estimate when one is
-        // provided. Buffer is asymmetric because the heuristic tends to
-        // under-count slightly: try several counts above the estimate first,
-        // then a few below as a safety net.
         let candidates: [Int] = {
             guard n > 0 else { return [] }
-            if estimate > 0 {
-                let upper = min(n, estimate + 5)
-                let lower = max(1, estimate - 3)
-                return Array((lower...upper).reversed())
-            }
-            return Array((1...n).reversed())
+            guard estimate > 0 else { return Array((1...n).reversed()) }
+            let upper = min(n, estimate + 5)
+            let lower = max(1, estimate - 2)
+            return Array((lower...upper).reversed())
         }()
-        // Compute the full day-grouping once for this call (events are already
-        // sorted by start date, so a single pass yields contiguous groups).
-        // Each candidate then takes a cheap O(d) prefix slice instead of
-        // re-running Dictionary(grouping:) per candidate.
         let groups = computeFullGrouping(events)
-
         ViewThatFits(in: .vertical) {
             ForEach(candidates, id: \.self) { count in
-                let sliced = sliceGrouping(groups, count: count)
                 if publishCount {
-                    renderColumn(precomputed: sliced)
+                    renderColumn(precomputed: sliceGrouping(groups, count: count))
                         .preference(key: LeftFitCountKey.self, value: count)
                 } else {
-                    renderColumn(precomputed: sliced)
+                    renderColumn(precomputed: sliceGrouping(groups, count: count))
                 }
             }
         }
@@ -259,6 +254,15 @@ struct EventsEntryView: View {
 
     @ViewBuilder
     private func eventRow(_ event: EventDisplay, day: Date) -> some View {
+        // Per-row Button(intent:) was too expensive — each Button costs ~25ms to
+        // construct due to AppIntent binding overhead, multiplied by candidates × columns.
+        // Click handling lives at the widget level via a single Button wrapping the
+        // entire entry view (see UpcomingEventsWidget.swift).
+        eventRowBody(event, day: day)
+    }
+
+    @ViewBuilder
+    private func eventRowBody(_ event: EventDisplay, day: Date) -> some View {
         let tint = color(event.calendarColorHex)
         HStack(alignment: .center, spacing: 8) {
             Image(systemName: "calendar")
@@ -412,9 +416,9 @@ struct EventsEntryView: View {
         family == .systemMedium ? 18 : 20
     }
 
-    private var rowVerticalPadding: CGFloat { family == .systemMedium ? 3 : 4 }
-    private var rowSpacing: CGFloat { family == .systemMedium ? 2 : 3 }
-    private var contentVerticalPadding: CGFloat { 8 }
+    private var rowVerticalPadding: CGFloat { family == .systemMedium ? 2 : 3 }
+    private var rowSpacing: CGFloat { 2 }
+    private var contentVerticalPadding: CGFloat { 6 }
     private var contentHorizontalPadding: CGFloat { family == .systemMedium ? 8 : 10 }
-    private var dayHeaderSpacing: CGFloat { family == .systemMedium ? 5 : 6 }
+    private var dayHeaderSpacing: CGFloat { 4 }
 }
