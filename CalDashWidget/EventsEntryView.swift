@@ -68,39 +68,42 @@ struct EventsEntryView: View {
     }
 
     private var groupedListView: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if family == .systemExtraLarge {
-                twoColumnLayout
-            } else {
-                adaptiveColumn(events: entry.events)
+        // Outer GeometryReader so geo.size.height is the full widget interior
+        // (NOT pre-padded). `computeFitCount` subtracts contentVerticalPadding
+        // once internally to get usable space.
+        GeometryReader { geo in
+            VStack(alignment: .leading, spacing: 0) {
+                if family == .systemExtraLarge {
+                    twoColumnLayout(height: geo.size.height)
+                } else {
+                    let est = computeFitCount(from: 0, height: geo.size.height)
+                    adaptiveColumn(events: entry.events, estimate: est)
+                }
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 0)
+            .padding(.vertical, contentVerticalPadding)
+            .padding(.horizontal, contentHorizontalPadding)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .padding(.vertical, contentVerticalPadding)
-        .padding(.horizontal, contentHorizontalPadding)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    private var twoColumnLayout: some View {
-        GeometryReader { geo in
-            // Left column gets the full event list. ViewThatFits picks the largest
-            // count that fits and publishes it via a PreferenceKey. Right column
-            // starts at exactly that index and gets the rest of the events,
-            // running its own ViewThatFits — both columns end up snug.
-            //
-            // Before the first preference fires, fall back to a heuristic so the
-            // right column still has a sensible slice to render against.
-            let estimate = computeFitCount(from: 0, height: geo.size.height)
-            let leftEnd = leftFitCount > 0 ? leftFitCount : estimate
-            let rightSlice = Array(entry.events.dropFirst(leftEnd))
+    private func twoColumnLayout(height: CGFloat) -> some View {
+        // Both columns get a heuristic-derived fit estimate so ViewThatFits only
+        // needs to evaluate a small window of candidates around it (~9 each)
+        // instead of the full ladder up to fetchLimit (60). PreferenceKey
+        // publishes the chosen left count so the right column starts exactly
+        // where the left column ended — no gaps.
+        let leftEst = computeFitCount(from: 0, height: height)
+        let leftEnd = leftFitCount > 0 ? leftFitCount : leftEst
+        let rightSlice = Array(entry.events.dropFirst(leftEnd))
+        let rightEst = computeFitCount(from: leftEnd, height: height)
 
-            HStack(alignment: .top, spacing: 16) {
-                adaptiveColumn(events: entry.events, publishCount: true)
-                adaptiveColumn(events: rightSlice, publishCount: false)
-            }
-            .onPreferenceChange(LeftFitCountKey.self) { newValue in
-                if newValue != leftFitCount { leftFitCount = newValue }
-            }
+        return HStack(alignment: .top, spacing: 16) {
+            adaptiveColumn(events: entry.events, estimate: leftEst, publishCount: true)
+            adaptiveColumn(events: rightSlice, estimate: rightEst, publishCount: false)
+        }
+        .onPreferenceChange(LeftFitCountKey.self) { newValue in
+            if newValue != leftFitCount { leftFitCount = newValue }
         }
     }
 
@@ -160,29 +163,81 @@ struct EventsEntryView: View {
     }
 
     @ViewBuilder
-    private func adaptiveColumn(events: [EventDisplay], publishCount: Bool = false) -> some View {
+    private func adaptiveColumn(
+        events: [EventDisplay],
+        estimate: Int = 0,
+        publishCount: Bool = false
+    ) -> some View {
         let n = events.count
-        let candidates = n > 0 ? Array((1...n).reversed()) : []
+        // Narrow candidate window around the heuristic estimate when one is
+        // provided. Buffer is asymmetric because the heuristic tends to
+        // under-count slightly: try several counts above the estimate first,
+        // then a few below as a safety net.
+        let candidates: [Int] = {
+            guard n > 0 else { return [] }
+            if estimate > 0 {
+                let upper = min(n, estimate + 5)
+                let lower = max(1, estimate - 3)
+                return Array((lower...upper).reversed())
+            }
+            return Array((1...n).reversed())
+        }()
+        // Compute the full day-grouping once for this call (events are already
+        // sorted by start date, so a single pass yields contiguous groups).
+        // Each candidate then takes a cheap O(d) prefix slice instead of
+        // re-running Dictionary(grouping:) per candidate.
+        let groups = computeFullGrouping(events)
 
         ViewThatFits(in: .vertical) {
             ForEach(candidates, id: \.self) { count in
+                let sliced = sliceGrouping(groups, count: count)
                 if publishCount {
-                    renderColumn(precomputed: prefixGrouping(events, count: count))
+                    renderColumn(precomputed: sliced)
                         .preference(key: LeftFitCountKey.self, value: count)
                 } else {
-                    renderColumn(precomputed: prefixGrouping(events, count: count))
+                    renderColumn(precomputed: sliced)
                 }
             }
         }
     }
 
-    private func prefixGrouping(_ events: [EventDisplay], count: Int) -> [(day: Date, events: [EventDisplay])] {
-        let prefix = Array(events.prefix(count))
-        let today = Calendar.current.startOfDay(for: entry.date)
-        let grouped = Dictionary(grouping: prefix) { event in
-            max(today, Calendar.current.startOfDay(for: event.startDate))
+    private func computeFullGrouping(_ events: [EventDisplay]) -> [(day: Date, events: [EventDisplay])] {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: entry.date)
+        var result: [(day: Date, events: [EventDisplay])] = []
+        var currentDay: Date? = nil
+        var currentEvents: [EventDisplay] = []
+        for event in events {
+            let day = max(today, cal.startOfDay(for: event.startDate))
+            if currentDay != day {
+                if let cd = currentDay { result.append((cd, currentEvents)) }
+                currentDay = day
+                currentEvents = [event]
+            } else {
+                currentEvents.append(event)
+            }
         }
-        return grouped.keys.sorted().map { ($0, grouped[$0] ?? []) }
+        if let cd = currentDay { result.append((cd, currentEvents)) }
+        return result
+    }
+
+    private func sliceGrouping(
+        _ groups: [(day: Date, events: [EventDisplay])],
+        count: Int
+    ) -> [(day: Date, events: [EventDisplay])] {
+        var remaining = count
+        var out: [(day: Date, events: [EventDisplay])] = []
+        for group in groups {
+            if remaining == 0 { break }
+            if group.events.count <= remaining {
+                out.append(group)
+                remaining -= group.events.count
+            } else {
+                out.append((group.day, Array(group.events.prefix(remaining))))
+                remaining = 0
+            }
+        }
+        return out
     }
 
     private func renderColumn(precomputed: [(day: Date, events: [EventDisplay])]) -> some View {
