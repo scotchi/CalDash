@@ -42,23 +42,20 @@ struct EventsTimelineProvider: AppIntentTimelineProvider {
 
         var events = store.fetchUpcoming(from: now, through: end)
         // EventKit returns all-day events that merely touch the requested window.
-        // For all-day events, normalize end to the END of the last visible calendar
-        // day so events whose source stores endDate as start-of-last-day midnight
-        // (e.g., some Google sync paths) aren't dropped while still active. For
-        // timed events, raw endDate suffices.
+        // For all-day events, derive the last visible calendar day from endDate
+        // robustly: step back one second and take that day, clamped to startDate.
+        // Handles canonical exclusive-midnight endDate, 23:59:59 inclusive endDate,
+        // and collapsed endDate==startDate alike.
         let cal = Calendar.current
         events = events.filter { event in
             guard event.isAllDay else { return event.endDate > now }
-            let lastDayStart: Date
-            if event.endDate > event.startDate.addingTimeInterval(86_400 - 60) {
-                // Canonical exclusive end → last visible day = endDate − 1 day.
-                lastDayStart = cal.startOfDay(
-                    for: cal.date(byAdding: .day, value: -1, to: event.endDate) ?? event.endDate
-                )
+            let probe: Date
+            if event.endDate > event.startDate {
+                probe = cal.date(byAdding: .second, value: -1, to: event.endDate) ?? event.endDate
             } else {
-                // Inclusive-or-collapsed end → last visible day = startDate's day.
-                lastDayStart = cal.startOfDay(for: event.startDate)
+                probe = event.startDate
             }
+            let lastDayStart = cal.startOfDay(for: max(probe, event.startDate))
             let endOfLastVisibleDay = cal.date(byAdding: .day, value: 1, to: lastDayStart) ?? lastDayStart
             return endOfLastVisibleDay > now
         }
