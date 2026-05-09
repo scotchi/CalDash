@@ -22,33 +22,46 @@ struct EventsTimelineProvider: AppIntentTimelineProvider {
     }
 
     func snapshot(for configuration: ConfigurationAppIntent, in context: Context) async -> EventsEntry {
-        await makeEntry(for: configuration, family: context.family)
+        await makeEntry(for: configuration, family: context.family, at: Date())
     }
 
     func timeline(for configuration: ConfigurationAppIntent, in context: Context) async -> Timeline<EventsEntry> {
-        let entry = await makeEntry(for: configuration, family: context.family)
-        let next = Date().addingTimeInterval(15 * 60)
-        return Timeline(entries: [entry], policy: .after(next))
+        // Emit two entries: one for now, one for the next local midnight. The
+        // system swaps to the midnight entry reliably even when it has decided
+        // not to re-run the provider for hours, so yesterday's all-day events
+        // drop out at the day boundary regardless of refresh budget.
+        let now = Date()
+        let cal = Calendar.current
+        let midnight = cal.nextDate(
+            after: now,
+            matching: DateComponents(hour: 0, minute: 0, second: 0),
+            matchingPolicy: .nextTime
+        ) ?? now.addingTimeInterval(86_400)
+
+        async let nowEntry = makeEntry(for: configuration, family: context.family, at: now)
+        async let midnightEntry = makeEntry(for: configuration, family: context.family, at: midnight)
+        let entries = await [nowEntry, midnightEntry]
+        let next = midnight.addingTimeInterval(15 * 60)
+        return Timeline(entries: entries, policy: .after(next))
     }
 
-    private func makeEntry(for configuration: ConfigurationAppIntent, family: WidgetFamily) async -> EventsEntry {
+    private func makeEntry(for configuration: ConfigurationAppIntent, family: WidgetFamily, at referenceDate: Date) async -> EventsEntry {
         let access = store.accessState
         guard access == .authorized else {
-            return EventsEntry(date: .now, configuration: configuration, events: [], accessState: access)
+            return EventsEntry(date: referenceDate, configuration: configuration, events: [], accessState: access)
         }
 
-        let now = Date()
-        let end = Calendar.current.date(byAdding: .day, value: 365, to: now) ?? now.addingTimeInterval(60 * 60 * 24 * 365)
+        let cal = Calendar.current
+        let end = cal.date(byAdding: .day, value: 365, to: referenceDate) ?? referenceDate.addingTimeInterval(60 * 60 * 24 * 365)
 
-        var events = store.fetchUpcoming(from: now, through: end)
+        var events = store.fetchUpcoming(from: referenceDate, through: end)
         // EventKit returns all-day events that merely touch the requested window.
         // For all-day events, derive the last visible calendar day from endDate
         // robustly: step back one second and take that day, clamped to startDate.
         // Handles canonical exclusive-midnight endDate, 23:59:59 inclusive endDate,
         // and collapsed endDate==startDate alike.
-        let cal = Calendar.current
         events = events.filter { event in
-            guard event.isAllDay else { return event.endDate > now }
+            guard event.isAllDay else { return event.endDate > referenceDate }
             let probe: Date
             if event.endDate > event.startDate {
                 probe = cal.date(byAdding: .second, value: -1, to: event.endDate) ?? event.endDate
@@ -57,7 +70,7 @@ struct EventsTimelineProvider: AppIntentTimelineProvider {
             }
             let lastDayStart = cal.startOfDay(for: max(probe, event.startDate))
             let endOfLastVisibleDay = cal.date(byAdding: .day, value: 1, to: lastDayStart) ?? lastDayStart
-            return endOfLastVisibleDay > now
+            return endOfLastVisibleDay > referenceDate
         }
         if configuration.hideAllDay {
             events = events.filter { !$0.isAllDay }
@@ -68,7 +81,7 @@ struct EventsTimelineProvider: AppIntentTimelineProvider {
 
         let limit = fetchLimit(family: family)
         let display = store.display(from: events, limit: limit)
-        return EventsEntry(date: now, configuration: configuration, events: display, accessState: access)
+        return EventsEntry(date: referenceDate, configuration: configuration, events: display, accessState: access)
     }
 
     private func parsePerWidgetRules(_ raw: String?) -> [FilterRule] {

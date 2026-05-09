@@ -361,9 +361,12 @@ struct EventsEntryView: View {
         guard isMultiDayAllDay(event) else {
             return cal.startOfDay(for: event.startDate)
         }
-        // Multi-day all-day: endDate is exclusive midnight, so last visible = endDate − 1 day.
-        let oneDayBefore = cal.date(byAdding: .day, value: -1, to: event.endDate) ?? event.endDate
-        return cal.startOfDay(for: oneDayBefore)
+        // Multi-day all-day: endDate may be canonical exclusive midnight
+        // (lastDay+1 at 00:00) or Calendar.app's inclusive form (lastDay at
+        // 23:59:59). Stepping back one second lands on the last visible day in
+        // both cases.
+        let oneSecondBefore = cal.date(byAdding: .second, value: -1, to: event.endDate) ?? event.endDate
+        return cal.startOfDay(for: oneSecondBefore)
     }
 
     private func allDayRangeText(_ event: EventDisplay) -> String {
